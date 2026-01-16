@@ -16,15 +16,17 @@
 #define FONT_SIZE 25
 
 #define CELL_SIZE 15.0f
-
 #define MIN_POLYGON_DIST 10.0f
+#define MIN_POLYGON_LEN 3.0f
+#define SMOOTH_RATIO 0.75f
+#define SMOOTH_ITERATION 10
 
-#define VEIN_RADIUS 7.0f
+#define VEIN_RADIUS 10.0f
 #define VEIN_CENTER 2.0f
 #define FIRST_VEIN_RADIUS 3*VEIN_RADIUS
 #define FIRST_VEIN_OFFSET 2*VEIN_RADIUS
 
-#define AUXIN_RADIUS 10.0f
+#define AUXIN_RADIUS 15.0f
 #define AUXIN_DOT_RADIUS 2.0f
 #define AUXIN_SPRAY_THRESHOLD 100
 
@@ -409,8 +411,7 @@ static bool drawing(Polygon2 *polygon, Vector2 seed_coord, int width, int height
     DrawCircle(seed_coord.x, seed_coord.y, FIRST_VEIN_RADIUS, WHITE);
     DrawCircle(seed_coord.x, seed_coord.y, VEIN_CENTER, BLACK);
 
-    polygon_valid = len_v2(sub_v2(mouse, p)) > MIN_POLYGON_DIST;
-    if (polygon_valid) polygon_valid = distance_v2(p, mouse, seed_coord, true) > FIRST_VEIN_RADIUS;
+    polygon_valid = distance_v2(p, mouse, seed_coord, true) > FIRST_VEIN_RADIUS;
     if (polygon_valid) polygon_valid = !segment_intersect_polygon(p, mouse, polygon);
 
     for (size_t i = 0; i < polygon->count - 1; i++) {
@@ -473,7 +474,7 @@ static void eliminate_auxins(Auxins *auxins, const Veins *veins, const Polygon2 
     // Collect indeces to remove
     for (size_t i = 0; i < auxins->count; i++) {
         float min_dist;
-        if (!point_inside(auxins->items[i].center, polygon, &min_dist) || min_dist < AUXIN_RADIUS / 2) {
+        if (!point_inside(auxins->items[i].center, polygon, &min_dist) || min_dist < (auxins->items[i].radius / 2)) {
             DA_APPEND((&to_remove), i);
             continue;
         }
@@ -655,11 +656,11 @@ static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
                 break;
             }
         }
-        if (!used_as_parent)
-            DA_APPEND(&leaves, i);
+        if (!used_as_parent) DA_APPEND(&leaves, i);
     }
 
     for (size_t i = 0; i < leaves.count; i++) {
+        // Traverse from leaf to root
         Branch v = (Branch){0};
         Node *node = &veins->items[leaves.items[i]];
         DA_APPEND(&v, node->center);
@@ -669,6 +670,35 @@ static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
         }
         // Finish branch with the root point
         DA_APPEND((&v), root);
+
+        // Smooth resulting polyline: Chaikin’s Method
+        Branch prev = (Branch){0};
+        for (size_t n = 0; n < SMOOTH_ITERATION; n++) {
+            prev.count = v.count;
+            prev.capacity = v.capacity;
+            prev.items = v.items;
+            v = (Branch){0};
+            for (size_t i = 0; i < prev.count - 1; i++) {
+                Vector2 a = prev.items[i];
+                Vector2 b = prev.items[i + 1];
+
+                Vector2 ab = sub_v2(b, a);
+                if (len_v2(ab) > MIN_POLYGON_LEN) {
+                    Vector2 m1 = (Vector2){a.x + ab.x * (1 - SMOOTH_RATIO), a.y + ab.y * (1 - SMOOTH_RATIO)};
+                    Vector2 m2 = (Vector2){a.x + ab.x * SMOOTH_RATIO,       a.y + ab.y * SMOOTH_RATIO};
+                    if (i == 0) DA_APPEND((&v), a);
+                    DA_APPEND((&v), m1);
+                    DA_APPEND((&v), m2);
+                } else {
+                    DA_APPEND((&v), a);
+                    DA_APPEND((&v), b);
+                }
+            }
+            DA_APPEND((&v), prev.items[prev.count - 1]);
+            free(prev.items);
+        }
+
+        // Add branch to the tree
         DA_APPEND(tree, v);
     }
 
@@ -690,12 +720,33 @@ int main(void) {
     polygon.closed = false;
     DA_APPEND(&polygon, ((Vector2){width / 2, height - FIRST_VEIN_OFFSET / 2}));
 
+    Veins veins = (Veins){0};
     Vector2 seed_coord = {width / 2, height - FIRST_VEIN_RADIUS - FIRST_VEIN_OFFSET};
 
-    Veins veins = (Veins){0};
-    DA_APPEND(&veins, ((Node){(Vector2){seed_coord.x - VEIN_RADIUS, seed_coord.y - VEIN_RADIUS}, VEIN_RADIUS, .closest_source_indeces = (Indeces){0}, .parent=(Vector2){-1, -1}}));
-    DA_APPEND(&veins, ((Node){seed_coord,                                                        VEIN_RADIUS, .closest_source_indeces = (Indeces){0}, .parent=veins.items[0].center}));
-    DA_APPEND(&veins, ((Node){(Vector2){seed_coord.x + VEIN_RADIUS, seed_coord.y + VEIN_RADIUS}, VEIN_RADIUS, .closest_source_indeces = (Indeces){0}, .parent=veins.items[1].center}));
+    // Several first nodes
+    Node vein1 = {
+        .center=(Vector2){seed_coord.x, seed_coord.y - VEIN_RADIUS * 2},
+        .radius=VEIN_RADIUS,
+        .closest_source_indeces=(Indeces){0},
+        .parent=(Vector2){-1,-1}
+    };
+    DA_APPEND(&veins, vein1);
+
+    Node vein2 = {
+        .center=seed_coord,
+        .radius=VEIN_RADIUS,
+        .closest_source_indeces=(Indeces){0},
+        .parent=veins.items[0].center
+    };
+    DA_APPEND(&veins, vein2);
+
+    Node vein3 = {
+        .center=(Vector2){seed_coord.x, seed_coord.y + VEIN_RADIUS * 2},
+        .radius=VEIN_RADIUS,
+        .closest_source_indeces=(Indeces){0},
+        .parent=veins.items[1].center
+    };
+    DA_APPEND(&veins, vein3);
 
     Auxins auxins = (Auxins){0};
     Vertices vertices = (Vertices){0};
@@ -756,11 +807,11 @@ int main(void) {
                     DrawRing(auxins.items[i].center, auxins.items[i].radius, auxins.items[i].radius + 1, 0, 360, 200, PINK);
                 }
 
-                // 4. Associate each auxin with vein node that is closes to it
+                // 3. Associate each auxin with vein node that is closes to it
                 associate_auxins(&auxins, &veins, &polygon);
 
-                // 5. Construct normalized vectors from the vein node to each associated auzin source
-                // 6. Sum constructed vectors and normalize it again -> calculate location of new node and add them
+                // 4. Construct normalized vectors from the vein node to each associated auzin source.
+                // Sum constructed vectors and normalize it again -> calculate location of new node and add them
                 produce_new_nodes(&auxins, &polygon, &veins);
             } break;
             case STOPPED: {

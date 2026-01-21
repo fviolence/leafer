@@ -11,6 +11,8 @@
 #define WIDTH  800
 #define HEIGHT 600
 
+#define FINAL_ATTEMPS 1000
+
 #define BLINK_DURATION 0.4f
 
 #define FONT_SIZE 25
@@ -25,6 +27,7 @@
 #define VEIN_CENTER 2.0f
 #define FIRST_VEIN_RADIUS 3*VEIN_RADIUS
 #define FIRST_VEIN_OFFSET 2*VEIN_RADIUS
+#define TOLERATION_RATIO 0.9f
 
 #define AUXIN_RADIUS 15.0f
 #define AUXIN_DOT_RADIUS 2.0f
@@ -460,7 +463,7 @@ static void spray_auxins(Auxins *auxins, const Polygon2 *polygon, int width, int
     while (auxins->count < AUXIN_SPRAY_THRESHOLD) {
         Vector2 p = {GetRandomValue(0, width), GetRandomValue(0, height)};
         float min_dist;
-        if (point_inside(p, polygon, &min_dist) && min_dist > MIN_POLYGON_DIST) {
+        if (point_inside(p, polygon, &min_dist) && min_dist > AUXIN_DOT_RADIUS) {
             assert(min_dist < __FLT_MAX__ && "A point inside the shape should have finite minimal distance");
             DA_APPEND(auxins, ((Source){.center=p, .radius=AUXIN_RADIUS, .closest_node_index=0}));
         }
@@ -468,10 +471,8 @@ static void spray_auxins(Auxins *auxins, const Polygon2 *polygon, int width, int
 }
 
 static void eliminate_auxins(Auxins *auxins, const Veins *veins, const Polygon2 *polygon) {
-    static Indeces to_remove = (Indeces){0};
-    to_remove.count = 0; // DON'T FORGET TO ZERO COUNT
-
     // Collect indeces to remove
+    Indeces to_remove = (Indeces){0};
     for (size_t i = 0; i < auxins->count; i++) {
         float min_dist;
         if (!point_inside(auxins->items[i].center, polygon, &min_dist) || min_dist < (auxins->items[i].radius / 2)) {
@@ -495,13 +496,17 @@ static void eliminate_auxins(Auxins *auxins, const Veins *veins, const Polygon2 
         auxins->items[auxin_idx] = auxins->items[auxins->count - 1];
         auxins->count--;
     }
+    if (to_remove.items) free(to_remove.items);
 }
 
 static void associate_auxins(Auxins *auxins, Veins *veins, const Polygon2 *polygon) {
-    static Indeces to_remove = (Indeces){0};
-    to_remove.count = 0; // DON'T FORGET TO ZERO COUNT
+    // Clear previous closest sources
+    for (size_t i = 0; i < veins->count; i++) {
+        veins->items[i].closest_source_indeces.count = 0;
+    }
 
     // Find closest node for each auxin
+    Indeces to_remove = (Indeces){0};
     for (size_t i = 0; i < auxins->count; i++) {
         float min_dist = __FLT_MAX__;
         auxins->items[i].closest_node_index = veins->count;
@@ -527,11 +532,7 @@ static void associate_auxins(Auxins *auxins, Veins *veins, const Polygon2 *polyg
         auxins->items[auxin_idx] = auxins->items[auxins->count - 1];
         auxins->count--;
     }
-
-    // Clear previous closest sources
-    for (size_t i = 0; i < veins->count; i++) {
-        veins->items[i].closest_source_indeces.count = 0;
-    }
+    if (to_remove.items) free(to_remove.items);
 
     // Associate auxins with correcponding nodes
     for (size_t i = 0; i < auxins->count; i++) {
@@ -539,7 +540,6 @@ static void associate_auxins(Auxins *auxins, Veins *veins, const Polygon2 *polyg
         assert(vein_idx < veins->count && "Invalid auxin leaked into association");
         DA_APPEND((&veins->items[vein_idx].closest_source_indeces), i);
     }
-
 }
 
 static Edge2 closest_edge(Vector2 point, const Polygon2 *polygon, float *min_dist) {
@@ -562,37 +562,77 @@ static Edge2 closest_edge(Vector2 point, const Polygon2 *polygon, float *min_dis
 }
 
 static void produce_new_nodes(const Auxins *auxins, const Polygon2 *polygon, Veins *veins) {
-    size_t veins_cnt = veins->count;
-    for (size_t i = 0; i < veins_cnt; i++) {
+    // Indices of veins to be processed
+    Indeces to_process = (Indeces){0};
+    for (size_t i = 0; i < veins->count; i++) {
         const Node *node = &veins->items[i];
         // Skip nodes with no connections
         if (node->closest_source_indeces.count == 0) continue;
+        DA_APPEND(&to_process, i);
+    }
+
+    // Indices of veins that have sources pulling them (sorted in descending order of magnitude)
+    Indeces to_duplicate = (Indeces){0};
+    while (to_process.count > 0) {
+        // Find maximum magnitude
+        size_t max_connections = 0;
+        for (size_t k = 0; k < to_process.count; k++) {
+            size_t i = to_process.items[k];
+            if (veins->items[i].closest_source_indeces.count > max_connections)
+                max_connections = veins->items[i].closest_source_indeces.count;
+        }
+        // Move nodes with maximum magnitude to array for further duplication
+        for (size_t k = 0; k < to_process.count;) {
+            size_t i = to_process.items[k];
+            if (veins->items[i].closest_source_indeces.count == max_connections) {
+                DA_APPEND(&to_duplicate, i);
+                // processed - delete
+                assert(to_process.count > 0 && "Attempting to remove from an empty array");
+                to_process.items[k] = to_process.items[to_process.count - 1];
+                to_process.count--;
+            } else {
+                k++;
+            }
+        }
+    }
+    if (to_process.items) free(to_process.items);
+
+    // Duplicate nodes in descending order by their pulling force.
+    for (size_t k = 0; k < to_duplicate.count; k++) {
+        size_t i = to_duplicate.items[k];
+        const Node *parent = &veins->items[i];
 
         // Calculate normalized sum
         Vector2 normalized_sum = (Vector2){0};
-        for (size_t j = 0; j < node->closest_source_indeces.count; j++) {
-            size_t auxin_idx = node->closest_source_indeces.items[j];
-            normalized_sum = add_v2(normalized_sum, norm_v2(sub_v2(auxins->items[auxin_idx].center, node->center)));
+        for (size_t j = 0; j < parent->closest_source_indeces.count; j++) {
+            size_t auxin_idx = parent->closest_source_indeces.items[j];
+            normalized_sum = add_v2(normalized_sum, norm_v2(sub_v2(auxins->items[auxin_idx].center, parent->center)));
         }
         normalized_sum = norm_v2(normalized_sum); // Final normalization
 
         // Add new vein node
-        Vector2 new_center = add_v2(node->center, scale_v2(normalized_sum, 2 * node->radius));
+        Vector2 new_center = add_v2(parent->center, scale_v2(normalized_sum, 2 * parent->radius));
 
-        // Hackity hack to keep nodes further from edges
-        // Makes whole process very unstable, sadge
-        // float min_dist;
-        // Edge2 closest = closest_edge(new_center, polygon, &min_dist);
-        // if (min_dist < MIN_POLYGON_DIST) {
-        //     // Point on an infinite line defined by the edge closest to new center
-        //     Vector2 p = closest_on_segment(closest.a, closest.b, new_center, false);
-        //     Vector2 repulsion = scale_v2(norm_v2(sub_v2(new_center, p)), min_dist / MIN_POLYGON_DIST);
-        //     normalized_sum = norm_v2(add_v2(normalized_sum, repulsion));
-        //     new_center = add_v2(node->center, scale_v2(normalized_sum, 2 * node->radius));
-        // }
+        // Check if new node fits in
+        // Becuase nodes are sorted, this process always favours those with more sources attached
+        // Against edges
+        float min_dist;
+        Edge2 closest = closest_edge(new_center, polygon, &min_dist);
+        if (min_dist < (TOLERATION_RATIO * VEIN_RADIUS)) continue;
+        // Against other nodes
+        bool fits = true;
+        for (size_t j = 0; j < veins->count; j++) {
+            float cent_dist = len_v2(sub_v2(new_center, veins->items[j].center));
+            if (cent_dist < (TOLERATION_RATIO * ((float)VEIN_RADIUS + veins->items[j].radius))) {
+                fits = false;
+                break;
+            }
+        }
+        if (!fits) continue;
 
-        DA_APPEND(veins, ((Node){.center=new_center, .radius=VEIN_RADIUS, .closest_source_indeces=(Indeces){0}, .parent=node->center}));
+        DA_APPEND(veins, ((Node){.center=new_center, .radius=VEIN_RADIUS, .closest_source_indeces=(Indeces){0}, .parent=parent->center}));
     }
+    if (to_duplicate.items) free(to_duplicate.items);
 }
 
 static void construct_vertices(Vertices *vertices, const Polygon2 *polygon) {
@@ -686,7 +726,7 @@ static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
                 if (len_v2(ab) > MIN_POLYGON_LEN) {
                     Vector2 m1 = (Vector2){a.x + ab.x * (1 - SMOOTH_RATIO), a.y + ab.y * (1 - SMOOTH_RATIO)};
                     Vector2 m2 = (Vector2){a.x + ab.x * SMOOTH_RATIO,       a.y + ab.y * SMOOTH_RATIO};
-                    if (i == 0) DA_APPEND((&v), a);
+                    if (i == 0) DA_APPEND((&v), a); // to preserve original end point of a branch
                     DA_APPEND((&v), m1);
                     DA_APPEND((&v), m2);
                 } else {
@@ -694,7 +734,7 @@ static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
                     DA_APPEND((&v), b);
                 }
             }
-            DA_APPEND((&v), prev.items[prev.count - 1]);
+            DA_APPEND((&v), prev.items[prev.count - 1]); // to preserve original start point of a branch
             free(prev.items);
         }
 
@@ -718,10 +758,10 @@ int main(void) {
 
     Polygon2 polygon = (Polygon2){0};
     polygon.closed = false;
-    DA_APPEND(&polygon, ((Vector2){width / 2, height - FIRST_VEIN_OFFSET / 2}));
+    DA_APPEND(&polygon, ((Vector2){(float)width / 2, height - FIRST_VEIN_OFFSET / 2}));
 
     Veins veins = (Veins){0};
-    Vector2 seed_coord = {width / 2, height - FIRST_VEIN_RADIUS - FIRST_VEIN_OFFSET};
+    Vector2 seed_coord = {(float)width / 2, height - FIRST_VEIN_RADIUS - FIRST_VEIN_OFFSET};
 
     // Several first nodes
     Node vein1 = {
@@ -762,7 +802,8 @@ int main(void) {
     hint4_x = (width - strlen(hint4) * FONT_SIZE) / 2;
     hint4_y = height / 3 + 4 * FONT_SIZE;
 
-    int final_attemps = 100;
+    size_t prev_veins_count = veins.count;
+    int attemps_count = FINAL_ATTEMPS;
     while (!WindowShouldClose()) {
         BeginDrawing();
 
@@ -792,16 +833,6 @@ int main(void) {
                 // 2. Remove auxins which radius fits in any vein's center, draw them after
                 eliminate_auxins(&auxins, &veins, &polygon);
 
-                // At some point the growth stops and no new auxin will survive elimination
-                // Move to next stage after certain amount of last attempts
-                if (auxins.count == 0 && --final_attemps) {
-                    write_veins_file(&veins, "veins_out.bin");
-                    construct_vertices(&vertices, &polygon);
-                    traverse_parents(&veins, polygon.items[0], &tree);
-                    current_stage = STOPPED;
-                    break; // break of the switch
-                }
-
                 for (size_t i = 0; i < auxins.count; i++) {
                     DrawCircle(auxins.items[i].center.x, auxins.items[i].center.y, AUXIN_DOT_RADIUS, PINK);
                     DrawRing(auxins.items[i].center, auxins.items[i].radius, auxins.items[i].radius + 1, 0, 360, 200, PINK);
@@ -813,6 +844,22 @@ int main(void) {
                 // 4. Construct normalized vectors from the vein node to each associated auzin source.
                 // Sum constructed vectors and normalize it again -> calculate location of new node and add them
                 produce_new_nodes(&auxins, &polygon, &veins);
+
+                // At some point the growth stops, move to next stage after certain amount of last attempts
+                if (prev_veins_count == veins.count) {
+                    if (--attemps_count) {
+                        write_veins_file(&veins, "veins_out.bin");
+                        printf("Constructing vertices\n");
+                        construct_vertices(&vertices, &polygon);
+                        printf("Traversing parents\n");
+                        traverse_parents(&veins, polygon.items[0], &tree);
+                        current_stage = STOPPED;
+                        break; // break of the switch
+                    }
+                } else {
+                    prev_veins_count = veins.count;
+                    attemps_count = FINAL_ATTEMPS;
+                }
             } break;
             case STOPPED: {
                 ClearBackground(LIGHTGRAY);

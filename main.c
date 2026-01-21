@@ -20,8 +20,8 @@
 #define CELL_SIZE 15.0f
 #define MIN_POLYGON_DIST 10.0f
 #define MIN_POLYGON_LEN 3.0f
-#define SMOOTH_RATIO 0.75f
-#define SMOOTH_ITERATION 10
+#define SMOOTH_RATIO 0.80f
+#define SMOOTH_ITERATION 100
 
 #define VEIN_RADIUS 10.0f
 #define VEIN_CENTER 2.0f
@@ -685,7 +685,7 @@ static Node* node_by_parent(const Veins *veins, Vector2 parent) {
 }
 
 // Traverse vein nodes and create tree structure
-static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
+static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree, Tree *smoothTree) {
     Indeces leaves = (Indeces){0};
     for (size_t i = 0; i < veins->count; i++) {
         bool used_as_parent = false;
@@ -701,45 +701,57 @@ static void traverse_parents(const Veins *veins, Vector2 root, Tree *tree) {
 
     for (size_t i = 0; i < leaves.count; i++) {
         // Traverse from leaf to root
-        Branch v = (Branch){0};
+        Branch branch = (Branch){0};
         Node *node = &veins->items[leaves.items[i]];
-        DA_APPEND(&v, node->center);
+        DA_APPEND(&branch, node->center);
         while (!same_v2(node->parent, (Vector2){-1, -1})) {
             node = node_by_parent(veins, node->parent);
-            DA_APPEND((&v), node->center);
+            DA_APPEND((&branch), node->center);
         }
         // Finish branch with the root point
-        DA_APPEND((&v), root);
+        DA_APPEND((&branch), root);
+
+        // Add un-smoothed branch to a tree - copy data to avoid corruption later
+        Branch tmp = (Branch){0};
+        tmp.count = branch.count;
+        tmp.capacity = branch.count; // no need to waste mem
+        tmp.items = malloc(sizeof(*tmp.items) * tmp.capacity);
+        memcpy(tmp.items, branch.items, sizeof(*tmp.items) * tmp.count);
+        DA_APPEND(tree, tmp);
 
         // Smooth resulting polyline: Chaikin’s Method
-        Branch prev = (Branch){0};
         for (size_t n = 0; n < SMOOTH_ITERATION; n++) {
-            prev.count = v.count;
-            prev.capacity = v.capacity;
-            prev.items = v.items;
-            v = (Branch){0};
-            for (size_t i = 0; i < prev.count - 1; i++) {
-                Vector2 a = prev.items[i];
-                Vector2 b = prev.items[i + 1];
+            bool anySplitted = false;
+            // Swap items and fill 'branch' with smothed version
+            tmp.count = branch.count;
+            tmp.capacity = branch.capacity;
+            tmp.items = branch.items;
+            branch = (Branch){0};
+            for (size_t i = 0; i < tmp.count - 1; i++) {
+                Vector2 a = tmp.items[i];
+                Vector2 b = tmp.items[i + 1];
 
                 Vector2 ab = sub_v2(b, a);
                 if (len_v2(ab) > MIN_POLYGON_LEN) {
                     Vector2 m1 = (Vector2){a.x + ab.x * (1 - SMOOTH_RATIO), a.y + ab.y * (1 - SMOOTH_RATIO)};
                     Vector2 m2 = (Vector2){a.x + ab.x * SMOOTH_RATIO,       a.y + ab.y * SMOOTH_RATIO};
-                    if (i == 0) DA_APPEND((&v), a); // to preserve original end point of a branch
-                    DA_APPEND((&v), m1);
-                    DA_APPEND((&v), m2);
+                    if (i == 0) DA_APPEND((&branch), a);    // to preserve original end point of a branch
+                    DA_APPEND((&branch), m1);
+                    DA_APPEND((&branch), m2);
+                    anySplitted = true;
                 } else {
-                    DA_APPEND((&v), a);
-                    DA_APPEND((&v), b);
+                    DA_APPEND((&branch), a);
+                    DA_APPEND((&branch), b);
                 }
             }
-            DA_APPEND((&v), prev.items[prev.count - 1]); // to preserve original start point of a branch
-            free(prev.items);
-        }
+            DA_APPEND((&branch), tmp.items[tmp.count - 1]); // to preserve original start (root) point of a branch
+            free(tmp.items);
 
-        // Add branch to the tree
-        DA_APPEND(tree, v);
+            // avoid unnecessary work
+            if (!anySplitted) break;
+        }
+        // Add smoothed branch to a tree
+        DA_APPEND(smoothTree, branch);
     }
 
     free(leaves.items);
@@ -791,6 +803,7 @@ int main(void) {
     Auxins auxins = (Auxins){0};
     Vertices vertices = (Vertices){0};
     Tree tree = (Tree){0};
+    Tree smoothTree = (Tree){0};
 
     // define set of global vars
     hint1_x = (width - strlen(hint1) * FONT_SIZE / 2) / 2;
@@ -804,6 +817,7 @@ int main(void) {
 
     size_t prev_veins_count = veins.count;
     int attemps_count = FINAL_ATTEMPS;
+    bool showSmoothed = true;
     while (!WindowShouldClose()) {
         BeginDrawing();
 
@@ -852,7 +866,7 @@ int main(void) {
                         printf("Constructing vertices\n");
                         construct_vertices(&vertices, &polygon);
                         printf("Traversing parents\n");
-                        traverse_parents(&veins, polygon.items[0], &tree);
+                        traverse_parents(&veins, polygon.items[0], &tree, &smoothTree);
                         current_stage = STOPPED;
                         break; // break of the switch
                     }
@@ -862,7 +876,10 @@ int main(void) {
                 }
             } break;
             case STOPPED: {
+                if (IsKeyPressed(KEY_SPACE)) showSmoothed = !showSmoothed;
+
                 ClearBackground(LIGHTGRAY);
+                DrawText("Space to enable/disable pattern smoothing", 10, 10, 2 * FONT_SIZE / 3, (Color){ 120, 120, 120, 255 });
 
                 for (size_t i = 0; i < vertices.count; i++) {
                     const Triangle2 *t = &vertices.items[i];
@@ -874,7 +891,7 @@ int main(void) {
                 }
 
                 for (size_t i = 0; i < tree.count; i++) {
-                    const Branch *v = &tree.items[i];
+                    const Branch *v = (showSmoothed) ? &smoothTree.items[i] : &tree.items[i];
                     for (size_t j = 0; j < v->count - 1; j++) {
                         float t = (float)j / (float)v->count;
                         float thickness = LEAF_VEIN_THCK_START + (LEAF_VEIN_THCK_END - LEAF_VEIN_THCK_START) * t;

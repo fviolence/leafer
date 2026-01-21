@@ -24,17 +24,19 @@
 #define SMOOTH_ITERATION 100
 
 #define VEIN_RADIUS 10.0f
+#define VEIN_RADIUS_MIN 3.0f
 #define VEIN_CENTER 2.0f
-#define FIRST_VEIN_RADIUS 3*VEIN_RADIUS
-#define FIRST_VEIN_OFFSET 2*VEIN_RADIUS
 #define TOLERATION_RATIO 0.9f
+// Generation ratio is used to calculate the reduction in node radius
+// hense starting with some relatively big number
+#define GEN_START 50
 
-#define AUXIN_RADIUS 15.0f
+#define AUXIN_RADIUS 10.0f
 #define AUXIN_DOT_RADIUS 2.0f
 #define AUXIN_SPRAY_THRESHOLD 100
 
 #define LEAF_VEIN_THCK_START 1.0f
-#define LEAF_VEIN_THCK_END   5.5f
+#define LEAF_VEIN_THCK_END   6.0f
 #define LEAF_COLOR_VEIN1     (Color){175, 189, 34, 170}
 #define LEAF_COLOR_VEIN2     (Color){109, 179, 63, 140}
 #define LEAF_COLOR_OUTLINE   GREEN
@@ -94,6 +96,7 @@ typedef struct Node {
     float radius;
     Indeces closest_source_indeces;
     Vector2 parent;
+    size_t gen;
 } Node;
 
 typedef struct Veins {
@@ -373,6 +376,7 @@ static bool segment_intersect_polygon(Vector2 a, Vector2 b, const Polygon2 *poly
 static bool drawing(Polygon2 *polygon, Vector2 seed_coord, int width, int height) {
     static double dt;
     static bool blink_happening = false;
+    static const float first_node_radius = 2 * VEIN_RADIUS;
 
     // draw cells for easier drawing
     for (int x = CELL_SIZE; x < width; x += CELL_SIZE)
@@ -390,7 +394,7 @@ static bool drawing(Polygon2 *polygon, Vector2 seed_coord, int width, int height
     if (IsKeyPressed(KEY_SPACE)) {
         polygon_valid = polygon->count >= 3;
         // Check if the line from the last commited point to the first intersect the vein
-        if (polygon_valid) polygon_valid = distance_v2(p, polygon->items[0], seed_coord, true) > FIRST_VEIN_RADIUS;
+        if (polygon_valid) polygon_valid = distance_v2(p, polygon->items[0], seed_coord, true) > first_node_radius;
         // Or any previous edge
         if (polygon_valid) polygon_valid = !segment_intersect_polygon(p, polygon->items[0], polygon);
         if (polygon_valid) return true; // drawing finished
@@ -411,10 +415,10 @@ static bool drawing(Polygon2 *polygon, Vector2 seed_coord, int width, int height
     DrawText(hint2, hint2_x, hint2_y, FONT_SIZE, (Color){ 10, 10, 10, 180 });
     DrawText(hint3, hint3_x, hint3_y, FONT_SIZE, (Color){ 10, 10, 10, 180 });
 
-    DrawCircle(seed_coord.x, seed_coord.y, FIRST_VEIN_RADIUS, WHITE);
+    DrawCircle(seed_coord.x, seed_coord.y, first_node_radius, WHITE);
     DrawCircle(seed_coord.x, seed_coord.y, VEIN_CENTER, BLACK);
 
-    polygon_valid = distance_v2(p, mouse, seed_coord, true) > FIRST_VEIN_RADIUS;
+    polygon_valid = distance_v2(p, mouse, seed_coord, true) > first_node_radius;
     if (polygon_valid) polygon_valid = !segment_intersect_polygon(p, mouse, polygon);
 
     for (size_t i = 0; i < polygon->count - 1; i++) {
@@ -561,7 +565,7 @@ static Edge2 closest_edge(Vector2 point, const Polygon2 *polygon, float *min_dis
     return edge;
 }
 
-static void produce_new_nodes(const Auxins *auxins, const Polygon2 *polygon, Veins *veins) {
+static void produce_new_nodes(const Auxins *auxins, const Polygon2 *polygon, Veins *veins, size_t gen) {
     // Indices of veins to be processed
     Indeces to_process = (Indeces){0};
     for (size_t i = 0; i < veins->count; i++) {
@@ -610,27 +614,30 @@ static void produce_new_nodes(const Auxins *auxins, const Polygon2 *polygon, Vei
         }
         normalized_sum = norm_v2(normalized_sum); // Final normalization
 
+        float new_radius = parent->radius * (float)parent->gen / (float)gen;
+        if (new_radius < VEIN_RADIUS_MIN) new_radius = VEIN_RADIUS_MIN;
+
         // Add new vein node
-        Vector2 new_center = add_v2(parent->center, scale_v2(normalized_sum, 2 * parent->radius));
+        Vector2 new_center = add_v2(parent->center, scale_v2(normalized_sum, parent->radius + new_radius));
 
         // Check if new node fits in
         // Becuase nodes are sorted, this process always favours those with more sources attached
         // Against edges
         float min_dist;
         Edge2 closest = closest_edge(new_center, polygon, &min_dist);
-        if (min_dist < (TOLERATION_RATIO * VEIN_RADIUS)) continue;
+        if (min_dist < (TOLERATION_RATIO * new_radius)) continue;
         // Against other nodes
         bool fits = true;
         for (size_t j = 0; j < veins->count; j++) {
             float cent_dist = len_v2(sub_v2(new_center, veins->items[j].center));
-            if (cent_dist < (TOLERATION_RATIO * ((float)VEIN_RADIUS + veins->items[j].radius))) {
+            if (cent_dist < (TOLERATION_RATIO * ((float)new_radius + veins->items[j].radius))) {
                 fits = false;
                 break;
             }
         }
         if (!fits) continue;
 
-        DA_APPEND(veins, ((Node){.center=new_center, .radius=VEIN_RADIUS, .closest_source_indeces=(Indeces){0}, .parent=parent->center}));
+        DA_APPEND(veins, ((Node){.center=new_center, .radius=new_radius, .closest_source_indeces=(Indeces){0}, .parent=parent->center, .gen=gen}));
     }
     if (to_duplicate.items) free(to_duplicate.items);
 }
@@ -768,37 +775,33 @@ int main(void) {
     int height = GetScreenHeight();
     Stage current_stage = DRAWING;
 
+    Vector2 seed_coord = {(float)width / 2, height - 4 * VEIN_RADIUS};
+
     Polygon2 polygon = (Polygon2){0};
     polygon.closed = false;
-    DA_APPEND(&polygon, ((Vector2){(float)width / 2, height - FIRST_VEIN_OFFSET / 2}));
+    DA_APPEND(&polygon, ((Vector2){seed_coord.x, seed_coord.y + 3 * VEIN_RADIUS}));
 
     Veins veins = (Veins){0};
-    Vector2 seed_coord = {(float)width / 2, height - FIRST_VEIN_RADIUS - FIRST_VEIN_OFFSET};
 
     // Several first nodes
+    size_t gen = GEN_START;
     Node vein1 = {
-        .center=(Vector2){seed_coord.x, seed_coord.y - VEIN_RADIUS * 2},
+        .center=(Vector2){seed_coord.x, seed_coord.y + VEIN_RADIUS},
         .radius=VEIN_RADIUS,
         .closest_source_indeces=(Indeces){0},
-        .parent=(Vector2){-1,-1}
+        .parent=(Vector2){-1,-1},
+        .gen=gen++,
     };
     DA_APPEND(&veins, vein1);
 
     Node vein2 = {
-        .center=seed_coord,
+        .center=(Vector2){seed_coord.x, seed_coord.y - VEIN_RADIUS},
         .radius=VEIN_RADIUS,
         .closest_source_indeces=(Indeces){0},
-        .parent=veins.items[0].center
+        .parent=veins.items[0].center,
+        .gen=gen++,
     };
     DA_APPEND(&veins, vein2);
-
-    Node vein3 = {
-        .center=(Vector2){seed_coord.x, seed_coord.y + VEIN_RADIUS * 2},
-        .radius=VEIN_RADIUS,
-        .closest_source_indeces=(Indeces){0},
-        .parent=veins.items[1].center
-    };
-    DA_APPEND(&veins, vein3);
 
     Auxins auxins = (Auxins){0};
     Vertices vertices = (Vertices){0};
@@ -857,7 +860,7 @@ int main(void) {
 
                 // 4. Construct normalized vectors from the vein node to each associated auzin source.
                 // Sum constructed vectors and normalize it again -> calculate location of new node and add them
-                produce_new_nodes(&auxins, &polygon, &veins);
+                produce_new_nodes(&auxins, &polygon, &veins, gen);
 
                 // At some point the growth stops, move to next stage after certain amount of last attempts
                 if (prev_veins_count == veins.count) {
@@ -873,6 +876,7 @@ int main(void) {
                 } else {
                     prev_veins_count = veins.count;
                     attemps_count = FINAL_ATTEMPS;
+                    gen++;
                 }
             } break;
             case STOPPED: {
